@@ -1,13 +1,25 @@
 require('dotenv').config();
 const OpenAI = require("openai");
 const axios = require('axios');
-const axiosRetry = require('axios-retry');
+const sanitizeHtml = require('sanitize-html');
+const axiosRetry = require('axios-retry').default;
 const createCsvWriter = require('csv-writer').createObjectCsvWriter;
 
-const pages = 1048;
+const MAX_PAGES = 1048;
+
+const PERIODS = [
+  { start: "2024-01-01", end: "2024-02-09" },
+  { start: "2023-09-01", end: "2023-09-30" },
+  { start: "2023-03-01", end: "2023-03-31" }
+];
 
 // Configura o Axios para tentar novamente solicitações falhas
-axiosRetry(axios, { retries: 3 });
+axiosRetry(axios, { 
+  retries: 3,
+  retryDelay: (retryCount) => {
+    return retryCount * 1000;
+  }
+});
 
 // Configura Open.ai
 const openai = new OpenAI({
@@ -20,6 +32,11 @@ const huggyAxios = axios.create({
   headers: {
     'X-Authorization': `Bearer ${process.env.HUGGY_API_KEY}`
   }
+});
+
+huggyAxios.interceptors.request.use(request => {
+  console.log('Starting Request', request.url);
+  return request;
 });
 
 function sleep(ms) {
@@ -42,6 +59,7 @@ async function writeToCsv(rows) {
         {id: 'certificateType', title: 'Certificado Digital'},
         {id: 'issuer', title: 'Emissor'},
         {id: 'agent', title: 'Atendente'},
+        {id: 'channel', title: 'Canal'},
         {id: 'keywords', title: 'Palavras-Chave'},
         {id: 'resolved', title: 'Resolvido (Sim/Não)'},
         {id: 'sentiment', title: 'Sentimento (Positivo/Negativo/Neutro)'},
@@ -58,15 +76,26 @@ async function fetchChats() {
     let page = 0;
     let hasMore = true;
   
-    while (hasMore && page <= (pages - 1)) {
-      const response = await huggyAxios.get(`chats?page=${page}`);
-      if (response.data.length > 0) {
-        allChats = allChats.concat(response.data);
-        page++;
-      } else {
-        hasMore = false;
+    while (hasMore && page <= (MAX_PAGES - 1)) {
+      try {
+        const response = await huggyAxios.get(`chats?page=${page}`);
+        if (response.data.length > 0) {
+          const filteredChats = response.data.filter(chat => {
+            const closedAt = new Date(chat.closedAt);
+            return chat.closedAt && PERIODS.some(period => 
+              closedAt >= new Date(period.start) && closedAt <= new Date(period.end));
+          });
+          allChats = allChats.concat(filteredChats);
+          page++;
+        } else {
+          hasMore = false;
+        }
+        await sleep(3000); // Aguarda 3 segundos antes da próxima requisição        
+      } catch (err) {
+        console.error(err);
+        await sleep(15000); // 15 segundos
+        continue;
       }
-      await sleep(3000); // Aguarda 3 segundos antes da próxima requisição
     }
   
     return allChats;
@@ -78,15 +107,21 @@ async function fetchChats() {
     let page = 0;
     let hasMore = true;
   
-    while (hasMore && page <= (pages - 1)) {
-      const response = await huggyAxios.get(`chats/${chatId}/messages?page=${page}`);
-      if (response.data.length > 0) {
-        allMessages = allMessages.concat(response.data);
-        page++;
-      } else {
-        hasMore = false;
+    while (hasMore && page <= (MAX_PAGES - 1)) {
+      try {
+        const response = await huggyAxios.get(`chats/${chatId}/messages?page=${page}`);
+        if (response.data.length > 0) {
+          allMessages = allMessages.concat(response.data);
+          page++;
+        } else {
+          hasMore = false;
+        }
+        await sleep(2000); // Aguarda 2 segundos antes da próxima requisição        
+      } catch (err) {
+        console.error(err);
+        await sleep(15000); // 15 segundos
+        continue;
       }
-      await sleep(2000); // Aguarda 2 segundos antes da próxima requisição
     }
   
     return allMessages;
@@ -98,7 +133,7 @@ async function fetchChats() {
     const sortedMessages = messages.sort((a, b) => new Date(a.send_at) - new Date(b.send_at));
 
     // Filtra mensagens com body preenchido e formata o texto
-    const chatText = sortedMessages
+    let chatText = sortedMessages
     .filter(msg => (msg.body || msg.senderType !== 'virtual_agent'))
     .map(msg => {
         let senderLabel = 'atendente'; // Valor padrão
@@ -108,9 +143,16 @@ async function fetchChats() {
             senderLabel = 'bot';
         }
 
-        return `enviado por: ${senderLabel}\nmensagem: ${msg.body}`;
+        // Remove tags HTML
+        // const cleanBody = msg.body.replace(/<\/?[^>]+(>|$)/g, "");
+        const cleanBody = sanitizeHtml(msg.body);
+        return `enviado por: ${senderLabel}\nmensagem: ${cleanBody}`;
     })
     .join('\n');
+
+    // Truncar se exceder aproximadamente 12000 caracteres
+    const MAX_CHARS = 10000;
+    chatText = chatText.length > MAX_CHARS ? chatText.substring(0, MAX_CHARS) : chatText;
     
     try {
       const chatCompletion = await openai.chat.completions.create({
@@ -174,40 +216,40 @@ async function fetchChats() {
   
         for (const chat of chats) {
           await sleep(3000); // Aguarda 3 segundos antes da próxima requisição
-          const messages = await fetchMessages(chat.id);
-          
+          const messages = await fetchMessages(chat.id);          
           // Continue apenas se houver mensagens
-          if (!messages.length) continue;
+          if (!messages.length) continue;    
           
           // Assumindo que a primeira mensagem tenha as informações do cliente necessárias
           let customer = null;
           let customFields = {};
-    
+          
           let agent = "Não identificado"; // Valor padrão caso nenhum atendente seja identificado
-    
+          
           for (const message of messages) {
             if (message.customer) {
-                customer = message.customer;
-                customFields = message.customer.custom_fields || {};
+              customer = message.customer;
+              customFields = message.customer.custom_fields || {};
             }
             
             if (message.sender && message.sender.id !== message.customer?.id && !message.sender.name.includes("Treeunfe")) {
-                agent = message.sender.name; // Nome do atendente humano
-                break; // Sai do loop após identificar o atendente
-            }
-           }
-    
-    
-          let openai_anlysis = await analyzeChat(messages);
-          if (typeof openai_anlysis == 'string') {
-            try {
-                openai_anlysis = JSON.parse(openai_anlysis);
-            } catch ( err) {
-                console.error(err);
-                continue; // se nao posso avaliar, nao vale a pena registrar.
+              agent = message.sender.name; // Nome do atendente humano
+              break; // Sai do loop após identificar o atendente
             }
           }
 
+          let openai_anlysis = {};
+          try {
+            openai_anlysis = await analyzeChat(messages);
+            if (typeof openai_anlysis == 'string') {
+              openai_anlysis = JSON.parse(openai_anlysis);
+            }
+          } catch ( err) {
+            console.error(err);
+            await sleep(15000); // 15 segundos
+            continue; // se nao posso avaliar, nao vale a pena registrar.
+          }
+          
           const { resolved, sentiment, keywords, analysis } = openai_anlysis;
           const row = {
             chatId: chat.id,
@@ -222,6 +264,7 @@ async function fetchChats() {
             certificateType: customFields ? customFields.certificado_customer || '' : '',
             issuer:  customFields ? customFields.emissor_customer || '' : '',
             agent,
+            channel: chat.channels ? chat.channels[0].type : '',
             keywords: typeof keywords == 'array' ? keywords.join(', ') : keywords,
             resolved,
             sentiment,
